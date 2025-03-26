@@ -15,9 +15,50 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
+// ---------- DATA STRUCTURES ----------
+
+// A single stance: e.g., "supportive", "strong_agreement", with a short summary
+type Stance struct {
+	Type    string `json:"type"`
+	SubType string `json:"subtype"`
+	Summary string `json:"summary"`
+}
+
+// The function-call response structure for stance selection
+type StanceSelectionResponse struct {
+	Stances []Stance `json:"stances"`
+}
+
+// Each user gets a RedditSession
+type RedditSession struct {
+	ID              string
+	Prompt          string
+	Subreddit       string
+	SelectedStances []Stance // The stances chosen by GPT
+	Responses       []SimulatedComment
+	Done            bool
+	Error           error
+}
+
+// Comment-style response from a Reddit simulation
+type SimulatedComment struct {
+	Username string
+	Flair    string
+	Text     string
+	Replies  []SimulatedComment
+}
+
+// Session store (in-memory for now)
+var (
+	sessions      = make(map[string]*RedditSession)
+	sessionsMutex sync.Mutex
+)
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true }, // For local dev
 }
+
+// ---------- MAIN + ROUTES ----------
 
 func main() {
 	apiKey := os.Getenv("OPENAI_API_KEY")
@@ -26,11 +67,10 @@ func main() {
 	}
 	client := openai.NewClient(apiKey)
 
-	http.HandleFunc("/reddit", ServeNode(RedditHomePage()))
+	http.HandleFunc("/", ServeNode(RedditHomePage()))
+	http.HandleFunc("/new", ServeNode(RedditPromptPage()))
 
-	http.HandleFunc("/reddit/new", ServeNode(RedditPromptPage()))
-
-	http.HandleFunc("/reddit/start", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -46,23 +86,85 @@ func main() {
 			return
 		}
 
+		// Create and store the session
 		session := NewSession(prompt, subreddit)
-		log.Printf("[INFO] Created session %s with prompt", session.ID)
+		log.Printf("[INFO] Created session %s", session.ID)
 
-		selected, err := SelectPersonas(client, prompt, Personas)
-		if err != nil {
-			log.Printf("[ERROR] selecting personas: %v", err)
-			http.Error(w, "Failed to select personas", http.StatusInternalServerError)
-			return
-		}
-		session.SelectedPersonas = selected
+		// Kick off AI work in background goroutine
+		go func(sess *RedditSession) {
+			var wg sync.WaitGroup
 
-		log.Printf("[INFO] Created session %s with prompt", session.ID)
+			// 1) Get stances from GPT
+			selectedStances, err := generateStances(client, subreddit, prompt)
+			if err != nil {
+				log.Printf("[ERROR] generating stances: %v", err)
+				sess.Error = err
+				sess.Done = true
+				return
+			}
 
-		http.Redirect(w, r, "/reddit/session?id="+session.ID, http.StatusSeeOther)
+			// 2) Store stances in the session
+			sessionsMutex.Lock()
+			sess.SelectedStances = selectedStances
+			sessionsMutex.Unlock()
+
+			// 3) For each stance, generate a single top-level comment
+			for _, stance := range selectedStances {
+				text, err := GenerateResponseFromStance(client, prompt, stance)
+				if err != nil {
+					log.Printf("[ERROR] generating response: %v", err)
+					sess.Error = err
+					break
+				}
+
+				// Build the top-level comment
+				comment := SimulatedComment{
+					Username: fmt.Sprintf("%s_%s", stance.Type, stance.SubType),
+					Flair:    stance.Type,
+					Text:     text,
+				}
+
+				// Append to session and get its index
+				sessionsMutex.Lock()
+				idx := len(sess.Responses)
+				sess.Responses = append(sess.Responses, comment)
+				sessionsMutex.Unlock()
+
+				// Spawn a goroutine to generate a reply for THIS top-level comment
+				wg.Add(1)
+				go func(parentIndex int, parentText string) {
+					defer wg.Done()
+
+					replyText, err := GenerateReplyToComment(client, sess.Prompt, parentText)
+					if err != nil {
+						log.Printf("[ERROR] generating reply: %v", err)
+						// We'll just log the error. We won't stop the entire session.
+						return
+					}
+
+					child := SimulatedComment{
+						Username: randomReplyUsername(),
+						Flair:    "reply",
+						Text:     replyText,
+					}
+
+					sessionsMutex.Lock()
+					sess.Responses[parentIndex].Replies = append(sess.Responses[parentIndex].Replies, child)
+					sessionsMutex.Unlock()
+				}(idx, text)
+			}
+
+			// 4) Once ALL replies are done, mark the session done
+			go func() {
+				wg.Wait()
+				sess.Done = true
+			}()
+		}(session)
+
+		http.Redirect(w, r, "/session?id="+session.ID, http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/reddit/session", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		if id == "" {
 			http.Error(w, "Missing session ID", http.StatusBadRequest)
@@ -76,7 +178,7 @@ func main() {
 		ServeNode(RedditSessionPage(session.Prompt, session.ID))(w, r)
 	})
 
-	http.HandleFunc("/reddit/ws", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		if id == "" {
 			http.Error(w, "Missing session ID", http.StatusBadRequest)
@@ -94,36 +196,71 @@ func main() {
 			return
 		}
 		defer conn.Close()
-		log.Printf("WebSocket connected for session %s", sess.ID)
 
-		for _, persona := range sess.SelectedPersonas {
-			text, err := GenerateResponseFromPersona(client, sess.Prompt, persona)
-			if err != nil {
-				log.Printf("[ERROR] generating response: %v", err)
-				break
+		log.Printf("WebSocket connected for session %s", id)
+
+		lastSentTopLevel := 0
+		replyCounts := make([]int, 0)
+
+		// In your loop setup, you might do:
+		sessionsMutex.Lock()
+		replyCounts = make([]int, len(sess.Responses))
+		sessionsMutex.Unlock()
+
+		for {
+			sessionsMutex.Lock()
+			done := sess.Done
+
+			// 1) Check if any new top-level comments arrived
+			for lastSentTopLevel < len(sess.Responses) {
+				comment := sess.Responses[lastSentTopLevel]
+				html := RenderCommentRecursive(comment, 0).Render()
+				fmt.Println("Rendering comment:", html)
+				conn.WriteJSON(map[string]string{
+					"type":        "comment",
+					"parentIndex": fmt.Sprintf("%d", lastSentTopLevel),
+					"html":        html,
+				})
+				lastSentTopLevel++
+				replyCounts = append(replyCounts, len(comment.Replies))
 			}
-			comment := SimulatedComment{
-				Username: persona.Name,
-				Flair:    persona.Style,
-				Text:     text,
-				Upvotes:  rand.Intn(500),
+
+			// 2) Check each existing comment for new replies
+			for i, comment := range sess.Responses {
+				newReplyCount := len(comment.Replies)
+				if newReplyCount > replyCounts[i] {
+					// We have new replies
+					for r := replyCounts[i]; r < newReplyCount; r++ {
+						singleReply := comment.Replies[r]
+						replyHTML := RenderCommentRecursive(singleReply, 1).Render()
+						// We'll also send info about which parent index or comment ID to attach to
+						conn.WriteJSON(map[string]string{
+							"type":        "reply",
+							"parentIndex": fmt.Sprintf("%d", i),
+							"html":        replyHTML,
+						})
+					}
+					replyCounts[i] = newReplyCount
+				}
 			}
-			html := RenderSimulatedComment(comment).Render()
-			msg := map[string]string{"type": "comment", "html": html}
-			if err := conn.WriteJSON(msg); err != nil {
-				log.Printf("WebSocket write error: %v", err)
-				break
+
+			sessionsMutex.Unlock()
+
+			if done {
+				conn.WriteJSON(map[string]string{"type": "done"})
+				return
 			}
-			time.Sleep(2 * time.Second)
+			time.Sleep(500 * time.Millisecond)
 		}
-
-		conn.WriteJSON(map[string]string{"type": "done"})
 	})
 
 	log.Println("[INFO] Listening on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// ---------- LAYOUT / TEMPLATES ----------
+
+// Home page
 func RedditHomePage() *Node {
 	return DefaultLayout(
 		Div(Class("container mx-auto p-8 text-center space-y-4"),
@@ -131,30 +268,24 @@ func RedditHomePage() *Node {
 			P(Class("text-lg"),
 				T("This app helps you reflect on complex emotional situations by simulating a Reddit thread with multiple perspectives."),
 			),
-			A(Href("/reddit/new"),
+			A(Href("/new"),
 				Class("inline-block mt-4 text-blue-600 hover:underline"),
 				T("Start a New Post"),
 			),
 		),
-	)
-}
-
-func RenderSimulatedComment(c SimulatedComment) *Node {
-	return Div(Class("bg-white p-4 rounded shadow mb-4"),
-		Div(Class("flex items-center justify-between"),
-			Span(Class("font-semibold text-blue-700"), Text(c.Username)),
-			Span(Class("text-sm text-gray-500"), Text(c.Flair)),
+		Footer(
+			Class("text-center text-sm text-gray-500"),
+			T("ShadowReddit is not affiliated with Reddit in anyway."),
 		),
-		P(Class("mt-2 text-gray-800"), Text(c.Text)),
-		Div(Class("text-sm text-gray-500 mt-1"), Text(fmt.Sprintf("%d upvotes", c.Upvotes))),
 	)
 }
 
+// Page for user input
 func RedditPromptPage() *Node {
 	return DefaultLayout(
 		Main(Class("max-w-2xl mx-auto p-8 space-y-6"),
 			H1(Class("text-2xl font-bold"), T("ShadowReddit")),
-			Form(Method("POST"), Action("/reddit/start"),
+			Form(Method("POST"), Action("/start"),
 				Div(Class("mb-4"),
 					Label(For("prompt"), Class("block font-medium mb-1"), T("Your Problem (Reddit-style post)")),
 					TextArea(Id("prompt"), Name("prompt"), Class("w-full border rounded p-2"), Rows(6)),
@@ -174,262 +305,38 @@ func RedditPromptPage() *Node {
 	)
 }
 
-type Persona struct {
-	Name           string
-	Aliases        []string
-	Style          string
-	ResponseTraits string
+// RenderCommentRecursive renders a single comment, then any child replies.
+// 'indentLevel' tells us how far to indent for nested replies.
+func RenderCommentRecursive(c SimulatedComment, indentLevel int) *Node {
+	indentClass := fmt.Sprintf("ml-%d", indentLevel*6) // or any indentation you like
+
+	// Render this comment
+	mainComment := Div(Class(fmt.Sprintf("bg-white p-4 rounded shadow mb-4 %s", indentClass)),
+		Div(Class("flex items-center justify-between"),
+			Span(Class("font-semibold text-blue-700"), Text(c.Username)),
+			Span(Class("text-sm text-gray-500"), Text(c.Flair)),
+		),
+		P(Class("mt-2 text-gray-800"), Text(c.Text)),
+	)
+
+	// If no replies, just return
+	if len(c.Replies) == 0 {
+		return mainComment
+	}
+
+	// Container for nested replies
+	replyNodes := []*Node{mainComment}
+	for _, child := range c.Replies {
+		// Recursively render each child, incrementing indent
+		childNode := RenderCommentRecursive(child, indentLevel+1)
+		replyNodes = append(replyNodes, childNode)
+	}
+
+	// Combine this comment + all children
+	return Div(replyNodes...)
 }
 
-type PersonaSelectionResponse struct {
-	SelectedPersonas []Persona `json:"selected_personas"`
-}
-
-var Personas = []Persona{
-	{
-		Name:           "BrendaTheBoundary",
-		Aliases:        []string{"EmpathyBrenda", "TherapistThrowaway"},
-		Style:          "Therapist-adjacent, warm",
-		ResponseTraits: "Advocates for emotional intelligence, boundaries, and healthy communication. Likely to say 'You deserve to be treated with respect.'",
-	},
-	{
-		Name:           "SaltySage66",
-		Aliases:        []string{"OldTimerSage", "SeenItAll66"},
-		Style:          "Elder Redditor",
-		ResponseTraits: "Sarcastic but wise. Uses personal anecdotes and a 'seen it all' tone. Might say 'Kid, you’re setting yourself up for pain.'",
-	},
-	{
-		Name:           "JusticeJake",
-		Aliases:        []string{"MoralityJake", "LawAndOrder123"},
-		Style:          "Strong moral compass",
-		ResponseTraits: "Comes down hard on ethical violations. Sees things in right/wrong binaries.",
-	},
-	{
-		Name:           "NeutralNina",
-		Aliases:        []string{"BalancedNina", "BothSidesBot"},
-		Style:          "Fence-sitter",
-		ResponseTraits: "Avoids judgments. Asks reflective questions to explore nuance.",
-	},
-	{
-		Name:           "BluntBecca",
-		Aliases:        []string{"RealTalkBecca", "CutToIt"},
-		Style:          "No-nonsense realist",
-		ResponseTraits: "Cuts to the chase. Doesn’t sugarcoat. Might say 'Grow up and move on.'",
-	},
-	{
-		Name:           "EmpathyEli",
-		Aliases:        []string{"SoftSoulEli", "FeelingFriend"},
-		Style:          "Emotionally intelligent",
-		ResponseTraits: "Gentle, understanding, encourages forgiveness and reflection.",
-	},
-	{
-		Name:           "ChaosTom",
-		Aliases:        []string{"WildCardTom", "MemePhilosopher"},
-		Style:          "Trollish but insightful",
-		ResponseTraits: "Contrarian takes. Wild analogies. Might say 'You’re all wrong, this is a simulation.'",
-	},
-	{
-		Name:           "OverthinkOlivia",
-		Aliases:        []string{"WallOfText", "ThinkTankOlivia"},
-		Style:          "Analytical, verbose",
-		ResponseTraits: "Breaks down every detail into over-analysis. Long responses.",
-	},
-	{
-		Name:           "MomModeMarge",
-		Aliases:        []string{"RedditMom", "ProtectiveMarge"},
-		Style:          "Protective, older tone",
-		ResponseTraits: "Motherly advice. Uses phrases like 'If you were my kid...'",
-	},
-	{
-		Name:           "TinfoilTerry",
-		Aliases:        []string{"ParanoiaPatrol", "PlotHoleDetective"},
-		Style:          "Paranoid, skeptical",
-		ResponseTraits: "Suspects hidden motives. Might say 'Sounds like this was a setup.'",
-	},
-	{
-		Name:           "ZenZara",
-		Aliases:        []string{"InnerPeace", "FloatAwayZara"},
-		Style:          "Philosophical, abstract",
-		ResponseTraits: "Encourages detachment. Stoic or Buddhist tone. 'Suffering is attachment.'",
-	},
-	{
-		Name:           "DramaDan",
-		Aliases:        []string{"SpillTheTea", "EmotionalDan"},
-		Style:          "Overdramatizing, chaotic neutral",
-		ResponseTraits: "Thrives on emotional drama. Overblown metaphors and chaos takes.",
-	},
-	{
-		Name:           "TiredTina",
-		Aliases:        []string{"SeenThisBefore", "JadedJane"},
-		Style:          "Jaded by Reddit",
-		ResponseTraits: "Dismissive tone. Often says 'These posts are always the same.'",
-	},
-	{
-		Name:           "HeartfeltHenry",
-		Aliases:        []string{"HopefulHenry", "KindnessKarma"},
-		Style:          "Kind, optimistic",
-		ResponseTraits: "Believes people can grow. Encourages kindness and reconciliation.",
-	},
-	{
-		Name:           "SystemSam",
-		Aliases:        []string{"MacroLens", "SociologyNerd"},
-		Style:          "Systems thinker",
-		ResponseTraits: "Sees structural patterns and power dynamics behind personal events.",
-	},
-	{
-		Name:           "LonelyLarry",
-		Aliases:        []string{"SoloSoul", "SadBoyMode"},
-		Style:          "Vulnerable, projecting",
-		ResponseTraits: "Often turns things inward. Comments can feel somber or self-focused.",
-	},
-	{
-		Name:           "TrollPatrol",
-		Aliases:        []string{"RulesBot123", "AITAJudgeDredd"},
-		Style:          "Technical, pedantic",
-		ResponseTraits: "Strict on format, tone, and logic. Often asks for INFO or clarifies OP’s assumptions.",
-	},
-	{
-		Name:           "YesQueenYasmin",
-		Aliases:        []string{"HypeTrainYas", "BoldAdviceBabe"},
-		Style:          "Supportive hype friend",
-		ResponseTraits: "Big energy. Will yell 'DUMP HIM 🔥' and mean it.",
-	},
-	{
-		Name:           "LibrarianLee",
-		Aliases:        []string{"CiteYourSources", "ReferenceRobot"},
-		Style:          "Academic, precise",
-		ResponseTraits: "Links studies, sources, or Reddit posts. Rarely comments without references.",
-	},
-	{
-		Name:           "PastPainPaul",
-		Aliases:        []string{"TraumaTalkPaul", "HardLessons"},
-		Style:          "Trauma-informed",
-		ResponseTraits: "Brings heavy emotional experience. May say 'This reminds me of what I went through…'",
-	},
-}
-
-func SelectPersonas(client *openai.Client, userPrompt string, allPersonas []Persona) ([]Persona, error) {
-	personasJSON, err := json.Marshal(allPersonas)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal personas: %w", err)
-	}
-
-	systemPrompt := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: "You are selecting a diverse and relevant set of personas to simulate Reddit-style responses to the user's post. Your goal is to include a mix of perspectives (e.g., supportive, skeptical, moral, humorous, empathetic). The number of personas should be between 5 and 8. Avoid redundancy.",
-	}
-
-	userMessage := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: fmt.Sprintf("Post: %s\nAvailable Personas: %s", userPrompt, string(personasJSON)),
-	}
-
-	fn := openai.FunctionDefinition{
-		Name:        "select_personas",
-		Description: "Choose a diverse set of personas to respond to a Reddit-style thread",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"selected_personas": map[string]any{
-					"type": "array",
-					"items": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"name":            map[string]any{"type": "string"},
-							"aliases":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-							"style":           map[string]any{"type": "string"},
-							"response_traits": map[string]any{"type": "string"},
-						},
-						"required": []string{"name", "aliases", "style", "response_traits"},
-					},
-				},
-			},
-			"required": []string{"selected_personas"},
-		},
-	}
-
-	chatRequest := openai.ChatCompletionRequest{
-		Model: "gpt-4-0613",
-		Messages: []openai.ChatCompletionMessage{
-			systemPrompt,
-			userMessage,
-		},
-		Functions:    []openai.FunctionDefinition{fn},
-		FunctionCall: openai.FunctionCall{Name: "select_personas"},
-	}
-
-	chatResp, err := client.CreateChatCompletion(context.Background(), chatRequest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get response from OpenAI: %w", err)
-	}
-
-	choice := chatResp.Choices[0]
-	if choice.Message.FunctionCall == nil {
-		return nil, fmt.Errorf("no function call in OpenAI response")
-	}
-
-	var parsed PersonaSelectionResponse
-	err = json.Unmarshal([]byte(choice.Message.FunctionCall.Arguments), &parsed)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal function response: %w", err)
-	}
-
-	return parsed.SelectedPersonas, nil
-}
-
-func GenerateResponseFromPersona(client *openai.Client, prompt string, persona Persona) (string, error) {
-	systemMsg := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: fmt.Sprintf("You are roleplaying as a Reddit commenter named %s. You speak in a style described as: '%s'. Your responses are characterized by: '%s'. Write a single Reddit comment as this persona.", persona.Name, persona.Style, persona.ResponseTraits),
-	}
-
-	userMsg := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: fmt.Sprintf("Here is the Reddit post: %s", prompt),
-	}
-
-	resp, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
-		Model:    openai.GPT4,
-		Messages: []openai.ChatCompletionMessage{systemMsg, userMsg},
-	})
-	if err != nil {
-		return "", err
-	}
-
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("no response from OpenAI")
-	}
-
-	return resp.Choices[0].Message.Content, nil
-}
-
-// Each user gets a RedditSession
-type RedditSession struct {
-	ID               string
-	Prompt           string
-	Subreddit        string
-	SelectedPersonas []Persona
-	PostContent      string
-	Responses        []SimulatedComment
-	Done             bool
-	Error            error
-}
-
-// Comment-style response from a Reddit simulation
-type SimulatedComment struct {
-	Username string
-	Flair    string
-	Text     string
-	Upvotes  int
-	Replies  []SimulatedComment
-}
-
-// Session store
-var (
-	sessions      = make(map[string]*RedditSession)
-	sessionsMutex sync.Mutex
-)
-
+// Page that displays the simulated responses
 func RedditSessionPage(prompt string, sessionID string) *Node {
 	return DefaultLayout(
 		Div(Class("max-w-2xl mx-auto p-6 space-y-6"),
@@ -445,34 +352,46 @@ func RedditSessionPage(prompt string, sessionID string) *Node {
 				),
 			),
 			Script(Raw(fmt.Sprintf(`
-				const evtSource = new EventSource("/reddit/events?id=%s");
-				evtSource.onmessage = function(event) {
-					document.getElementById("responseArea").innerHTML = event.data;
-				};
-			`, sessionID))),
-		),
-		Script(Raw(fmt.Sprintf(`
-			let ws = new WebSocket("ws://" + window.location.host + "/reddit/ws?id=%s");
-			let responseArea = document.getElementById("responseArea");
+	let ws = new WebSocket("ws://" + window.location.host + "/ws?id=%s");
+	let responseArea = document.getElementById("responseArea");
 
-			ws.onmessage = function(event) {
-				let data = JSON.parse(event.data);
-				if (data.type === "comment") {
-					let div = document.createElement("div");
-					div.innerHTML = data.html;
-					responseArea.appendChild(div);
-				} else if (data.type === "done") {
-					let p = document.createElement("p");
-					p.innerText = "Simulation complete.";
-					responseArea.appendChild(p);
-					ws.close();
-				}
-			};
-		`, sessionID))),
+	ws.onmessage = function(event) {
+		let data = JSON.parse(event.data);
+
+		if (data.type === "comment") {
+			// Create a container for this top-level comment
+			let parentDiv = document.createElement("div");
+			parentDiv.setAttribute("id", "comment-" + data.parentIndex);
+			parentDiv.innerHTML = data.html;
+			responseArea.appendChild(parentDiv);
+
+		} else if (data.type === "reply") {
+			// Append a reply to an existing comment's container
+			let parentDiv = document.getElementById("comment-" + data.parentIndex);
+			if (!parentDiv) {
+				console.warn("No parent container found for index", data.parentIndex);
+				return;
+			}
+			let replyDiv = document.createElement("div");
+			replyDiv.innerHTML = data.html;
+			parentDiv.appendChild(replyDiv);
+
+		} else if (data.type === "done") {
+			// Signal that simulation is complete
+			let p = document.createElement("p");
+			p.innerText = "Simulation complete.";
+			responseArea.appendChild(p);
+			ws.close();
+		}
+	};
+`, sessionID))),
+		),
 	)
 }
 
-// Create a new session and store it
+// ---------- HELPER FUNCTIONS ----------
+
+// Creates a new session
 func NewSession(prompt, subreddit string) *RedditSession {
 	id := randomID()
 	s := &RedditSession{
@@ -486,7 +405,7 @@ func NewSession(prompt, subreddit string) *RedditSession {
 	return s
 }
 
-// Retrieve session by ID
+// Retrieves a session by ID
 func GetSession(id string) (*RedditSession, bool) {
 	sessionsMutex.Lock()
 	defer sessionsMutex.Unlock()
@@ -503,4 +422,173 @@ func randomID() string {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
 	return string(b)
+}
+
+func randomReplyUsername() string {
+	names := []string{
+		"ReplyMaster",
+		"CuriousCat",
+		"HonestAbe",
+		"DebateKing",
+		"FriendlyNeighbor",
+		"JustSaying",
+		"RandomUser",
+		"WittyRemark",
+		"SkepticalSam",
+		"AgreeableAlex",
+	}
+	return names[rand.Intn(len(names))]
+}
+
+// ---------- AI FUNCTIONS ----------
+
+// generateStances picks 5-8 stances from AllStances using GPT's function-calling
+func generateStances(client *openai.Client, thread string, post string) ([]Stance, error) {
+	// Create a JSON-safe string version of AllStances to pass to GPT
+	allStancesJSON, err := json.Marshal(AllStances)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal AllStances: %w", err)
+	}
+
+	systemPrompt := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleSystem,
+		Content: `You are helping choose a set of stances for a Reddit thread.
+Select 5 to 8 stances from a given list of predefined options. Choose perspectives that would likely be given. Do not invent new stances.
+Use only stances from the provided list. It is ok if stances are repeated.`,
+	}
+
+	userMessage := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		Content: fmt.Sprintf(`Reddit Thread Title: %s
+Post Content: %s
+
+Here is the full list of allowed stances (with type, subtype, and summary):
+%s`, thread, post, string(allStancesJSON)),
+	}
+
+	fn := openai.FunctionDefinition{
+		Name:        "select_stances",
+		Description: "Select 5 to 8 stances from a list of predefined options",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"stances": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"type":    map[string]any{"type": "string"},
+							"subtype": map[string]any{"type": "string"},
+							"summary": map[string]any{"type": "string"},
+						},
+						"required": []string{"type", "subtype", "summary"},
+					},
+				},
+			},
+			"required": []string{"stances"},
+		},
+	}
+
+	chatRequest := openai.ChatCompletionRequest{
+		Model: "gpt-4-0613",
+		Messages: []openai.ChatCompletionMessage{
+			systemPrompt,
+			userMessage,
+		},
+		Functions:    []openai.FunctionDefinition{fn},
+		FunctionCall: openai.FunctionCall{Name: "select_stances"},
+	}
+
+	chatResp, err := client.CreateChatCompletion(context.Background(), chatRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get response from OpenAI: %w", err)
+	}
+
+	choice := chatResp.Choices[0]
+	if choice.Message.FunctionCall == nil {
+		return nil, fmt.Errorf("no function call in OpenAI response")
+	}
+
+	var parsed StanceSelectionResponse
+	err = json.Unmarshal([]byte(choice.Message.FunctionCall.Arguments), &parsed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal function response: %w", err)
+	}
+
+	return parsed.Stances, nil
+}
+
+// GenerateResponseFromStance creates a single Reddit comment from a stance + user prompt
+func GenerateResponseFromStance(client *openai.Client, prompt string, stance Stance) (string, error) {
+	systemMsg := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleSystem,
+		Content: fmt.Sprintf(
+			`You are a Reddit commenter who holds the following stance:
+Type: %s
+SubType: %s
+Summary: %s
+
+Write a single Reddit comment responding to the user's post from this perspective.
+Your response should sound like a typical Reddit user with that viewpoint.
+`,
+			stance.Type, stance.SubType, stance.Summary,
+		),
+	}
+
+	userMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: fmt.Sprintf("Here is the Reddit post:\n%s", prompt),
+	}
+
+	resp, err := client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:    openai.GPT4,
+			Messages: []openai.ChatCompletionMessage{systemMsg, userMsg},
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from OpenAI")
+	}
+
+	return resp.Choices[0].Message.Content, nil
+}
+
+func GenerateReplyToComment(client *openai.Client, originalPost, parentComment string) (string, error) {
+	fmt.Println("Generating reply to comment")
+	systemMsg := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleSystem,
+		Content: `You are simulating a reply in a Reddit thread. 
+        You have the original post and a parent comment. 
+        Write a single reply as if you are another Reddit user. 
+        Keep it natural and typical of Reddit discussions.`,
+	}
+
+	userMsg := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		Content: fmt.Sprintf(`ORIGINAL POST:
+%s
+
+PARENT COMMENT:
+%s
+
+Please write a single short reply to the parent comment.`, originalPost, parentComment),
+	}
+
+	resp, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
+		Model:    openai.GPT4,
+		Messages: []openai.ChatCompletionMessage{systemMsg, userMsg},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from OpenAI")
+	}
+	return resp.Choices[0].Message.Content, nil
 }
